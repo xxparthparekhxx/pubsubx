@@ -136,7 +136,7 @@ def test_server_shutdown_no_client_thread_exception():
     old_hook = threading.excepthook
 
     def hook(args):
-        caught.append(args.exc_info[1])
+        caught.append(args.exc_value)
 
     threading.excepthook = hook
     try:
@@ -160,3 +160,22 @@ def test_server_shutdown_no_client_thread_exception():
 
     publisher.disconnect()
     assert not caught, f"exceptions in client threads: {caught}"
+
+
+def test_client_receive_thread_exits_on_server_shutdown():
+    """When the server stops, the client's receive thread must exit promptly."""
+    port = _free_port()
+    srv, thread = _start_server(port)
+
+    client = _connect(port)
+    client.subscribe("topic")
+    time.sleep(0.2)
+
+    srv.shutdown()
+    thread.join(timeout=2)
+
+    # The client's receive thread should finish within ~2 s once the server is gone.
+    client.receive_thread.join(timeout=2)
+    assert not client.receive_thread.is_alive(), "client receive thread did not exit after server shutdown"
+
+    client.disconnect()

@@ -26,6 +26,10 @@ class PubSubClient:
         self.running = False
         if self.socket:
             try:
+                self.socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 self.socket.close()
             except Exception:
                 pass

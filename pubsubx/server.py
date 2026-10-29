@@ -26,6 +26,12 @@ class PubSubServer:
                     client_thread.start()
                 except socket.timeout:
                     continue
+                except OSError:
+                    # The server socket was closed while shutting down; exit the
+                    # accept loop cleanly instead of printing "Bad file descriptor".
+                    if not self.running:
+                        break
+                    raise
         except KeyboardInterrupt:
             print("\nShutting down the server...")
         finally:
@@ -110,6 +116,10 @@ class PubSubServer:
                 self.topics.pop(topic, None)
         self.clients.pop(client_socket, None)
         try:
+            client_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
             client_socket.close()
         except Exception:
             pass
@@ -120,6 +130,10 @@ class PubSubServer:
         with self.lock:
             for client_socket in list(self.clients.keys()):
                 self.disconnect_client_locked(client_socket)
+        try:
+            self.server_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self.server_socket.close()
         print("Server shut down")
 

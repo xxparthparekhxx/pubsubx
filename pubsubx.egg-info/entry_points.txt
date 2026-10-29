@@ -1,2 +1,0 @@
-[console_scripts]
-pubsubx = pubsubx.__main__:main
