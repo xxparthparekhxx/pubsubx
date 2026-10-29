@@ -179,3 +179,81 @@ def test_client_receive_thread_exits_on_server_shutdown():
     assert not client.receive_thread.is_alive(), "client receive thread did not exit after server shutdown"
 
     client.disconnect()
+
+
+class _AcceptErrorInjector:
+    """Wraps a listening socket, delegating everything but accept(), which
+    raises ConnectionAbortedError on the first call and then delegates."""
+
+    def __init__(self, sock):
+        self._sock = sock
+        self.accept_calls = 0
+
+    def accept(self):
+        self.accept_calls += 1
+        if self.accept_calls == 1:
+            raise ConnectionAbortedError("Software caused connection abort")
+        return self._sock.accept()
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
+def test_transient_accept_error_does_not_kill_listener():
+    """A transient accept() error must not kill the listener.
+
+    The listening socket is wrapped so its very first accept() raises
+    ConnectionAbortedError while the server is running. The accept loop must
+    log it and keep accepting, so a client can still connect and receive a
+    published message afterwards.
+    """
+    port = _free_port()
+    srv = PubSubServer(host='localhost', port=port)
+    srv.server_socket = _AcceptErrorInjector(srv.server_socket)
+    thread = threading.Thread(target=srv.start, daemon=True)
+    thread.start()
+
+    # Wait until the server is accepting connections (this also proves the
+    # loop survived the first accept() raising).
+    for _ in range(200):
+        try:
+            probe = socket.create_connection(('localhost', port), timeout=0.2)
+            probe.close()
+            break
+        except OSError:
+            time.sleep(0.05)
+    assert srv.server_socket.accept_calls >= 1, "accept loop never raised the injected error"
+
+    received = []
+    subscriber = _connect(port)
+    subscriber.socket.settimeout(5.0)
+    subscriber.on_message(lambda topic, content: received.append((topic, content)))
+    subscriber.subscribe("news")
+    time.sleep(0.3)
+
+    publisher = _connect(port)
+    publisher.socket.settimeout(5.0)
+    time.sleep(0.3)
+    publisher.publish("news", "hello after transient accept error")
+    time.sleep(0.5)
+
+    assert ("news", "hello after transient accept error") in received
+
+    publisher.disconnect()
+    subscriber.disconnect()
+    srv.shutdown()
+    thread.join(timeout=2)
+
+
+def test_shutdown_is_idempotent(capsys):
+    """shutdown() must be safe to call twice and print "Server shut down" once."""
+    port = _free_port()
+    srv, thread = _start_server(port)
+
+    srv.shutdown()
+    srv.shutdown()  # Second call must be a no-op, not raise.
+
+    thread.join(timeout=2)
+
+    out = capsys.readouterr().out
+    assert out.count("Server shut down") == 1, f"expected exactly one shutdown message, got: {out!r}"

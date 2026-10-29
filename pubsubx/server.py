@@ -1,5 +1,7 @@
+import errno
 import socket
 import threading
+import time
 import json
 
 class PubSubServer:
@@ -11,6 +13,7 @@ class PubSubServer:
         self.topics = {}        # topic -> set of client_sockets
         self.lock = threading.RLock()
         self.running = True
+        self._shutdown = False  # Guard so shutdown() is idempotent.
 
     def start(self):
         self.server_socket.bind((self.host, self.port))
@@ -26,12 +29,23 @@ class PubSubServer:
                     client_thread.start()
                 except socket.timeout:
                     continue
-                except OSError:
-                    # The server socket was closed while shutting down; exit the
-                    # accept loop cleanly instead of printing "Bad file descriptor".
+                except OSError as e:
+                    # A transient accept() error (e.g. ECONNABORTED, EMFILE,
+                    # ENFILE) must not kill the listener: log it and keep
+                    # accepting while the server is running.
                     if not self.running:
                         break
-                    raise
+                    err = getattr(e, 'errno', None)
+                    if err in (errno.EBADF, errno.EINVAL):
+                        # The listening socket itself was closed during
+                        # shutdown; exit the accept loop cleanly.
+                        break
+                    print(f"Accept error: {e}; retrying...")
+                    if err in (errno.EMFILE, errno.ENFILE):
+                        # Too many open files: back off so the loop does not
+                        # spin tight on repeated failures.
+                        time.sleep(0.1)
+                    continue
         except KeyboardInterrupt:
             print("\nShutting down the server...")
         finally:
@@ -126,6 +140,13 @@ class PubSubServer:
         print("Client disconnected")
 
     def shutdown(self):
+        # Idempotent: a second call is a no-op, so "Server shut down" is
+        # printed exactly once even if shutdown() is called by the caller and
+        # again from start()'s finally block.
+        if self._shutdown:
+            return
+        self._shutdown = True
+
         self.running = False
         with self.lock:
             for client_socket in list(self.clients.keys()):
