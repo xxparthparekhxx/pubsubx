@@ -119,3 +119,44 @@ def test_subscriber_disconnects_mid_publish_without_dropping_publisher():
     publisher.disconnect()
     srv.shutdown()
     thread.join(timeout=2)
+
+
+def test_server_shutdown_no_client_thread_exception():
+    """Server shutdown must not raise RuntimeError in client receive threads.
+
+    When the server closes a connection, the client's receive thread calls
+    disconnect() itself; disconnect() must not try to join the running
+    thread (which would raise RuntimeError: cannot join current thread).
+    Exceptions in client threads are captured via threading.excepthook.
+    """
+    port = _free_port()
+    srv, thread = _start_server(port)
+
+    caught = []
+    old_hook = threading.excepthook
+
+    def hook(args):
+        caught.append(args.exc_info[1])
+
+    threading.excepthook = hook
+    try:
+        subscriber = _connect(port)
+        publisher = _connect(port)
+        subscriber.subscribe("topic")
+        time.sleep(0.2)
+
+        # User-facing disconnect (joins the receive thread from outside).
+        subscriber.disconnect()
+        time.sleep(0.2)
+
+        # Server shutdown closes the publisher's socket; its receive thread
+        # breaks out and calls disconnect() from within itself.
+        srv.shutdown()
+        thread.join(timeout=2)
+        # Give the publisher's receive thread time to exit cleanly.
+        time.sleep(0.5)
+    finally:
+        threading.excepthook = old_hook
+
+    publisher.disconnect()
+    assert not caught, f"exceptions in client threads: {caught}"

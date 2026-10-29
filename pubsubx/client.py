@@ -29,7 +29,10 @@ class PubSubClient:
                 self.socket.close()
             except Exception:
                 pass
-        if self.receive_thread:
+        # Don't join the receive thread from within itself; the receive
+        # thread is already exiting when it calls disconnect() (e.g. after
+        # the server closes the connection).
+        if self.receive_thread and threading.current_thread() is not self.receive_thread:
             self.receive_thread.join()
         print("Disconnected from server")
 
