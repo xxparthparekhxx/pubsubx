@@ -7,8 +7,9 @@ class PubSubServer:
         self.host = host
         self.port = port
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.clients = {}
-        self.topics = {}
+        self.clients = {}       # client_socket -> set of topics
+        self.topics = {}        # topic -> set of client_sockets
+        self.lock = threading.RLock()
         self.running = True
 
     def start(self):
@@ -31,56 +32,94 @@ class PubSubServer:
             self.shutdown()
 
     def handle_client(self, client_socket):
-        self.clients[client_socket] = set()
-        while self.running:
-            try:
-                data = client_socket.recv(1024).decode('utf-8')
+        with self.lock:
+            self.clients[client_socket] = set()
+        buffer = b''
+        try:
+            while self.running:
+                try:
+                    data = client_socket.recv(4096)
+                except (ConnectionError, OSError):
+                    break
                 if not data:
                     break
-                message = json.loads(data)
-                if message['action'] == 'subscribe':
-                    self.subscribe(client_socket, message['topic'])
-                elif message['action'] == 'publish':
-                    self.publish(client_socket, message['topic'], message['content'])
-            except json.JSONDecodeError:
-                print("Invalid JSON received")
-            except Exception as e:
-                print(f"Error handling client: {e}")
-                break
-        self.disconnect_client(client_socket)
+                # Newline-delimited JSON framing: a read may contain a partial
+                # message or several messages, so buffer and split on newlines.
+                buffer += data
+                while b'\n' in buffer:
+                    line, buffer = buffer.split(b'\n', 1)
+                    if not line.strip():
+                        continue
+                    try:
+                        message = json.loads(line.decode('utf-8'))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        print("Invalid JSON received")
+                        continue
+                    try:
+                        action = message.get('action')
+                        if action == 'subscribe':
+                            self.subscribe(client_socket, message['topic'])
+                        elif action == 'publish':
+                            self.publish(client_socket, message['topic'], message['content'])
+                    except Exception as e:
+                        print(f"Error handling message: {e}")
+        except Exception as e:
+            print(f"Error handling client: {e}")
+        finally:
+            self.disconnect_client(client_socket)
 
     def subscribe(self, client_socket, topic):
-        if topic not in self.topics:
-            self.topics[topic] = set()
-        self.topics[topic].add(client_socket)
-        self.clients[client_socket].add(topic)
+        with self.lock:
+            self.topics.setdefault(topic, set()).add(client_socket)
+            self.clients.setdefault(client_socket, set()).add(topic)
         print(f"Client subscribed to topic: {topic}")
 
     def publish(self, sender_socket, topic, content):
-        if topic in self.topics:
-            message = json.dumps({'topic': topic, 'content': content})
-            for client in self.topics[topic]:
-                if client != sender_socket:  # Don't send the message back to the sender
-                    try:
-                        client.send(message.encode('utf-8'))
-                    except Exception as e:
-                        print(f"Error sending message to client: {e}")
-                        self.disconnect_client(client)
+        # Iterate over a snapshot so a disconnecting subscriber never mutates
+        # the set we are iterating. Sends happen outside the lock.
+        with self.lock:
+            recipients = list(self.topics.get(topic, set()))
+        message = (json.dumps({'topic': topic, 'content': content}) + '\n').encode('utf-8')
+        dead = []
+        for client in recipients:
+            if client == sender_socket:  # Don't send the message back to the sender
+                continue
+            try:
+                client.sendall(message)
+            except Exception as e:
+                print(f"Error sending message to client: {e}")
+                dead.append(client)
+        # Remove dead clients after iteration is complete.
+        with self.lock:
+            for client in dead:
+                self.disconnect_client_locked(client)
         print(f"Message published to topic: {topic}")
 
     def disconnect_client(self, client_socket):
-        for topic in self.clients[client_socket]:
-            self.topics[topic].remove(client_socket)
-            if not self.topics[topic]:
-                del self.topics[topic]
-        del self.clients[client_socket]
-        client_socket.close()
+        with self.lock:
+            self.disconnect_client_locked(client_socket)
+
+    def disconnect_client_locked(self, client_socket):
+        # Caller must hold self.lock. Idempotent: safe to call for a socket
+        # that has already been removed.
+        if client_socket not in self.clients:
+            return
+        for topic in list(self.clients[client_socket]):
+            self.topics.get(topic, set()).discard(client_socket)
+            if not self.topics.get(topic):
+                self.topics.pop(topic, None)
+        self.clients.pop(client_socket, None)
+        try:
+            client_socket.close()
+        except Exception:
+            pass
         print("Client disconnected")
 
     def shutdown(self):
         self.running = False
-        for client_socket in list(self.clients.keys()):
-            self.disconnect_client(client_socket)
+        with self.lock:
+            for client_socket in list(self.clients.keys()):
+                self.disconnect_client_locked(client_socket)
         self.server_socket.close()
         print("Server shut down")
 

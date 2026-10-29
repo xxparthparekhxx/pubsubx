@@ -5,13 +5,13 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pubsubx",
-    version="0.1.2",
+    version="0.2.0",
     author="xxparthparekhxx",
     author_email="xx.parthparekh.xx@gmail.com",
     description="A publish-subscribe messaging system",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/simplepubsub",
+    url="https://github.com/xxparthparekhxx/pubsubx",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
